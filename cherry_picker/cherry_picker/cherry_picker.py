@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 #  -*- coding: utf-8 -*-
 
+from contextlib import contextmanager
+import os
 import click
 import collections
 import enum
@@ -12,9 +14,10 @@ import sys
 import requests
 import toml
 
-from gidgethub import sansio
+#from gidgethub import sansio
 
-from . import __version__
+#from . import __version__
+__version__="1c"
 
 CREATE_PR_URL_TEMPLATE = (
     "https://api.github.com/repos/{config[team]}/{config[repo]}/pulls"
@@ -23,7 +26,7 @@ DEFAULT_CONFIG = collections.ChainMap(
     {
         "team": "python",
         "repo": "cpython",
-        "check_sha": "7f777ed95a19224294949e1b4ce56bbffcb1fe9f",
+        "check_sha": "34d1d4a4674f89e7e0659cc7393be943426e4aec",
         "fix_commit_msg": True,
         "default_branch": "master",
     }
@@ -45,6 +48,7 @@ WORKFLOW_STATES = enum.Enum(
 
     PR_CREATING
     PR_OPENING
+    MERGE_CREATING
 
     REMOVING_BACKPORT_BRANCH
     REMOVING_BACKPORT_BRANCH_FAILED
@@ -160,7 +164,8 @@ class CherryPicker:
         return username
 
     def get_cherry_pick_branch(self, maint_branch):
-        return f"backport-{self.commit_sha1[:7]}-{maint_branch}"
+        #return f"backport-{self.commit_sha1[:7]}-{maint_branch}"
+        return f"RC"
 
     def get_pr_url(self, base_branch, head_branch):
         return f"https://github.com/{self.config['team']}/{self.config['repo']}/compare/{base_branch}...{self.username}:{head_branch}?expand=1"
@@ -170,6 +175,7 @@ class CherryPicker:
         set_state(WORKFLOW_STATES.FETCHING_UPSTREAM)
         cmd = ["git", "fetch", self.upstream, "--no-tags"]
         self.run_cmd(cmd)
+        click.echo(cmd)
         set_state(WORKFLOW_STATES.FETCHED_UPSTREAM)
 
     def run_cmd(self, cmd):
@@ -188,6 +194,25 @@ class CherryPicker:
             "-b",
             self.get_cherry_pick_branch(branch_name),
             f"{self.upstream}/{branch_name}",
+        ]
+        try:
+            self.run_cmd(cmd)
+        except subprocess.CalledProcessError as err:
+            click.echo(
+                f"Error checking out the branch {self.get_cherry_pick_branch(branch_name)}."
+            )
+            if " already exists"  in str(err.output):
+                click.echo(err.output)
+            else:
+                raise BranchCheckoutException(
+                    f"Error checking out the branch {self.get_cherry_pick_branch(branch_name)}."
+                )
+    def checkout_branch_simple(self, branch_name):
+        """ git checkout  <branch_name> """
+        cmd = [
+            "git",
+            "checkout",
+            f"{branch_name}",
         ]
         try:
             self.run_cmd(cmd)
@@ -218,6 +243,7 @@ class CherryPicker:
         set_state(WORKFLOW_STATES.CHECKING_OUT_DEFAULT_BRANCH)
 
         cmd = "git", "checkout", self.config["default_branch"]
+        click.echo(cmd)
         self.run_cmd(cmd)
 
         set_state(WORKFLOW_STATES.CHECKED_OUT_DEFAULT_BRANCH)
@@ -240,6 +266,16 @@ class CherryPicker:
             click.echo(err.output)
             raise CherryPickException(f"Error cherry-pick {self.commit_sha1}.")
 
+    def cherry_pick_commit(self, commit):
+        """ git cherry-pick -x <commit_sha1> """
+        cmd = ["git", "cherry-pick", "-x", commit]
+        try:
+            self.run_cmd(cmd)
+        except subprocess.CalledProcessError as err:
+            click.echo(f"Error cherry-pick {commit}.")
+            click.echo(err.output)
+            raise CherryPickException(f"Error cherry-pick {commit}.")
+
     def get_exit_message(self, branch):
         return f"""
 Failed to cherry-pick {self.commit_sha1} into {branch} \u2639
@@ -255,17 +291,17 @@ To abort the cherry-pick and cleanup:
     $ cherry_picker --abort
 """
 
-    def amend_commit_message(self, cherry_pick_branch):
+    def amend_commit_message(self, commit_sha1):
         """ prefix the commit message with (X.Y) """
 
         commit_prefix = ""
-        if self.prefix_commit:
-            commit_prefix = f"[{get_base_branch(cherry_pick_branch)}] "
-        updated_commit_message = f"""{commit_prefix}{self.get_commit_message(self.commit_sha1)}
-(cherry picked from commit {self.commit_sha1})
+        #if self.prefix_commit:
+        #    commit_prefix = f"[{get_base_branch(cherry_pick_branch)}] "
+        updated_commit_message = f"""{commit_prefix}{self.get_commit_message(commit_sha1)}
+(cherry picked from commit {commit_sha1})
 
 
-Co-authored-by: {get_author_info_from_short_sha(self.commit_sha1)}"""
+Co-authored-by: {get_author_info_from_short_sha(commit_sha1)}"""
         if self.dry_run:
             click.echo(f"  dry-run: git commit --amend -m '{updated_commit_message}'")
         else:
@@ -305,7 +341,7 @@ Co-authored-by: {get_author_info_from_short_sha(self.commit_sha1)}"""
     def create_gh_pr(self, base_branch, head_branch, *, commit_message, gh_auth):
         """
         Create PR in GitHub
-        """
+        
         request_headers = sansio.create_headers(self.username, oauth_token=gh_auth)
         title, body = normalize_commit_message(commit_message)
         if not self.prefix_commit:
@@ -324,6 +360,7 @@ Co-authored-by: {get_author_info_from_short_sha(self.commit_sha1)}"""
         else:
             click.echo(response.status_code)
             click.echo(response.text)
+        """
 
     def open_pr(self, url):
         """
@@ -340,6 +377,11 @@ Co-authored-by: {get_author_info_from_short_sha(self.commit_sha1)}"""
         cmd = ["git", "branch", "-D", branch]
         self.run_cmd(cmd)
 
+    def merge_default_branch(self, from_branch, to_branch):
+        self.checkout_branch_simple(to_branch)
+        cmd = ["git", "merge", "--log=2", "--no-ff", from_branch]
+        self.run_cmd(cmd)
+
     def cleanup_branch(self, branch):
         """Remove the temporary backport branch.
 
@@ -348,7 +390,8 @@ Co-authored-by: {get_author_info_from_short_sha(self.commit_sha1)}"""
         set_state(WORKFLOW_STATES.REMOVING_BACKPORT_BRANCH)
         self.checkout_default_branch()
         try:
-            self.delete_branch(branch)
+            #self.delete_branch(branch)
+            self.merge_default_branch(branch, self.config["default_branch"])
         except subprocess.CalledProcessError:
             click.echo(f"branch {branch} NOT deleted.")
             set_state(WORKFLOW_STATES.REMOVING_BACKPORT_BRANCH_FAILED)
@@ -361,8 +404,33 @@ Co-authored-by: {get_author_info_from_short_sha(self.commit_sha1)}"""
             raise click.UsageError("At least one branch must be specified.")
         set_state(WORKFLOW_STATES.BACKPORT_STARTING)
         self.fetch_upstream()
+        set_state(WORKFLOW_STATES.BACKPORT_LOOPING)
+        sha1_commits=self.commit_sha1.split(",")
+        cherry_pick_branch = self.get_cherry_pick_branch(maint_branch)
+        self.checkout_branch(self.branches)
+        for ind, commit in enumerate(sha1_commits):
+            set_state(WORKFLOW_STATES.BACKPORT_LOOP_START)
+            set_state_commit(",".join(sha1_commits[ind:]))
+            click.echo(f"Now backporting '{commit}' into '{self.branch}'")
+           
+            commit_message = ""
+            try:
+                self.cherry_pick_commit(commit)
+                commit_message = self.amend_commit_message(commit)
+            except subprocess.CalledProcessError as cpe:
+                click.echo(cpe.output)
+                click.echo(self.get_exit_message(self.branches))
+            except CherryPickException:
+                click.echo(self.get_exit_message(self.branches))
+                self.set_paused_state()
+                raise
+        self.merge_default_branch(cherry_pick_branch,self.config["default_branch"])
+        self.set_paused_state()
+
+
 
         set_state(WORKFLOW_STATES.BACKPORT_LOOPING)
+        #click.echo(self.sorted_branches)
         for maint_branch in self.sorted_branches:
             set_state(WORKFLOW_STATES.BACKPORT_LOOP_START)
             click.echo(f"Now backporting '{self.commit_sha1}' into '{maint_branch}'")
@@ -387,6 +455,7 @@ Co-authored-by: {get_author_info_from_short_sha(self.commit_sha1)}"""
                     )
                     self.cleanup_branch(cherry_pick_branch)
                 else:
+
                     click.echo(
                         f"""
 Finished cherry-pick {self.commit_sha1} into {cherry_pick_branch} \U0001F600
@@ -399,7 +468,9 @@ To abort the cherry-pick and cleanup:
     $ cherry_picker --abort
 """
                     )
+                    self.merge_default_branch(cherry_pick_branch,self.config["default_branch"])
                     self.set_paused_state()
+                    self.cleanup_branch(cherry_pick_branch)
                     return  # to preserve the correct state
             set_state(WORKFLOW_STATES.BACKPORT_LOOP_END)
         reset_state()
@@ -420,7 +491,7 @@ To abort the cherry-pick and cleanup:
             click.echo(cpe.output)
             set_state(WORKFLOW_STATES.ABORTING_FAILED)
         # only delete backport branch created by cherry_picker.py
-        if get_current_branch().startswith("backport-"):
+        if get_current_branch().startswith("RC-"):
             self.cleanup_branch(get_current_branch())
 
         reset_stored_config_ref()
@@ -436,7 +507,7 @@ To abort the cherry-pick and cleanup:
             raise ValueError("One can only continue a paused process.")
 
         cherry_pick_branch = get_current_branch()
-        if cherry_pick_branch.startswith("backport-"):
+        if cherry_pick_branch.startswith("RC-"):
             set_state(WORKFLOW_STATES.CONTINUATION_STARTED)
             # amend the commit message, prefix with [X.Y]
             base = get_base_branch(cherry_pick_branch)
@@ -493,7 +564,8 @@ To abort the cherry-pick and cleanup:
         is present in the repository that we're operating on.
         """
         try:
-            validate_sha(self.config["check_sha"])
+            pass
+            #validate_sha(self.commit_sha1)
         except ValueError:
             raise InvalidRepoException()
 
@@ -580,49 +652,70 @@ CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"])
     ),
     default=None,
 )
+@click.option(
+    "--git-dir",
+    "git_dir",
+    metavar="CONFIG-PATH",
+    help=(
+        "Path to config file, .cherry_picker.toml "
+        "from project root by default. You can prepend "
+        "a colon-separated Git 'commitish' reference."
+    ),
+    default=None,
+)
 @click.argument("commit_sha1", nargs=1, default="")
 @click.argument("branches", nargs=-1)
 @click.pass_context
 def cherry_pick_cli(
-    ctx, dry_run, pr_remote, abort, status, push, config_path, commit_sha1, branches
+    ctx, dry_run, pr_remote, abort, status, push, config_path, commit_sha1, branches, git_dir
 ):
     """cherry-pick COMMIT_SHA1 into target BRANCHES."""
+    with cwd(git_dir):
+        click.echo("\U0001F40D \U0001F352 \u26CF")
+        
+        chosen_config_path, config = load_config(config_path)
+        click.echo(f"Loaded config  {config['check_sha']}, param {commit_sha1}")
 
-    click.echo("\U0001F40D \U0001F352 \u26CF")
-
-    chosen_config_path, config = load_config(config_path)
-
-    try:
-        cherry_picker = CherryPicker(
-            pr_remote,
-            commit_sha1,
-            branches,
-            dry_run=dry_run,
-            push=push,
-            config=config,
-            chosen_config_path=chosen_config_path,
-        )
-    except InvalidRepoException:
-        click.echo(f"You're not inside a {config['repo']} repo right now! \U0001F645")
-        sys.exit(-1)
-    except ValueError as exc:
-        ctx.fail(exc)
-
-    if abort is not None:
-        if abort:
-            cherry_picker.abort_cherry_pick()
-        else:
-            cherry_picker.continue_cherry_pick()
-
-    elif status:
-        click.echo(cherry_picker.status())
-    else:
         try:
-            cherry_picker.backport()
-        except BranchCheckoutException:
+            cherry_picker = CherryPicker(
+                pr_remote,
+                commit_sha1,
+                branches,
+                dry_run=dry_run,
+                push=push,
+                config=config,
+                chosen_config_path=chosen_config_path,
+            )
+        except InvalidRepoException:
+            click.echo(f"You're not inside a {config['repo']} repo right now! \U0001F645")
             sys.exit(-1)
-        except CherryPickException:
-            sys.exit(-1)
+        except ValueError as exc:
+            ctx.fail(exc)
+
+        if abort is not None:
+            if abort:
+                cherry_picker.abort_cherry_pick()
+            else:
+                cherry_picker.continue_cherry_pick()
+
+        elif status:
+            click.echo(cherry_picker.status())
+        else:
+            try:
+                cherry_picker.backport()
+            except BranchCheckoutException:
+                sys.exit(-1)
+            except CherryPickException:
+                sys.exit(-1)
+
+@contextmanager
+def cwd(path):
+    oldpwd=os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(oldpwd)
 
 
 def get_base_branch(cherry_pick_branch):
@@ -632,9 +725,9 @@ def get_base_branch(cherry_pick_branch):
     raises ValueError if the specified branch name is not of a form that
         cherry_picker would have created
     """
-    prefix, sha, base_branch = cherry_pick_branch.split("-", 2)
+    prefix, sha, base_branch = "RC", 123, "RC"
 
-    if prefix != "backport":
+    if prefix != "RC":
         raise ValueError(
             'branch name is not prefixed with "backport-".  Is this a cherry_picker branch?'
         )
@@ -672,6 +765,7 @@ def version_from_branch(branch):
     """
     return version information from a git branch name
     """
+    """
     try:
         return tuple(
             map(
@@ -685,6 +779,8 @@ def version_from_branch(branch):
         raise ValueError(
             f"Branch {branch} seems to not have a version in its name."
         ) from attr_err
+    """
+    return 1.1
 
 
 def get_current_branch():
@@ -746,6 +842,7 @@ def find_config(revision):
         return None
 
 
+
 def load_config(path=None):
     """Choose and return the config path and it's contents as dict."""
     # NOTE: Initially I wanted to inherit Path to encapsulate Git access
@@ -798,6 +895,17 @@ def reset_state():
 def set_state(state):
     """Save progress state into Git config."""
     save_cfg_vals_to_git_cfg(state=state.name)
+    #if self.dry_run:
+    click.echo(state)
+
+def set_state_commit(cfg_val):
+    """Save progress state into Git config."""
+    cfg_key = f'cherry-picker.commits'
+    cmd = "git", "config", "--local", cfg_key, cfg_val
+    subprocess.check_call(cmd, stderr=subprocess.STDOUT)
+    save_cfg_vals_to_git_cfg(state=state.name)
+    #if self.dry_run:
+    click.echo(state)
 
 
 def get_state():
